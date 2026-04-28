@@ -1,0 +1,19 @@
+# Rocket Landing Convex MPC
+# Python 3.12 | pip install -r requirements.txt
+ 
+# Core numerics
+numpy==2.2.6
+scipy==1.15.3
+ 
+# Convex optimization modeling layer
+cvxpy==1.6.7
+ 
+# Solvers (CVXPY will call these as backends)
+ecos==2.0.14        # free SOCP solver -- primary solver for this project
+scs>=3.2.4
+Mosek>=10.1
+clarabel==0.9.0     # modern free solver, good fallback for SOCPs
+osqp==0.6.7.post3   # free QP solver, used internally by CVXPY
+ 
+# Plotting
+matplotlib==3.9.4
