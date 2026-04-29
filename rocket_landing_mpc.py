@@ -110,12 +110,12 @@ def dynamics( tau, x, u ):
 
     h_dot     = tf * V * np.sin( gamma )
     s_dot     = tf * V * np.cos( gamma )
-    V_dot     = tf * ( -u1 - Dm - np.sin( gamma ) / r**2 )
-    gamma_dot = tf * ( -u2 / V - np.cos( gamma ) / ( r**2 * V ) )
+    V_dot     = tf * ( -u1 - Dm - ( p.g0 * np.sin( gamma ) ) )
+    gamma_dot = tf * ( -( u2 / V ) - ( p.g0 * np.cos( gamma ) / V ) )
     z_dot     = -tf * u3 / ( p.g0 * p.Isp )
     t_dot     = tf
 
-    return np.array([ h_dot, s_dot, V_dot, gamma_dot, z_dot, t_dot ] ) 
+    return np.array( [ h_dot, s_dot, V_dot, gamma_dot, z_dot, t_dot ] ) 
 
 # ─────────────────────────────────────────────
 # 4. LINEARIZATION  (Eq. 17-20)
@@ -153,29 +153,20 @@ def compute_ABC( xk, uk ):
     A[1, 2] = tf * np.cos( gamma )           # d/dV
     A[1, 3] = -tf * V * np.sin( gamma )      # d/d_gamma
 
-    # Row 2 : V_dot = tf*(-u1 - D/m - sin(gamma)/r^2)
-    # d/dr : tf * ( beta*(D/m) + 2*sin(gamma)/r^3 )
-    A[2, 0] = tf * ( p.beta * Dm + 2 * np.sin( gamma ) / r**3 )
-    # d/dV : tf * (-2*D/(m*V))     [because D ~ V^2]
-    A[2, 2] = tf * ( -2 * Dm / V )
-    # d/d_gamma : tf * (-cos(gamma)/r^2)
-    A[2, 3] = tf * ( -np.cos( gamma ) / r**2 )
-    # d/dz : tf * (D/m)            [because m = e^z, d(D/m)/dz = -D/m]
-    A[2, 4] = tf * Dm
+    # Row 2 : V_dot = tf*(-u1 - D/m - g0 sin(gamma))
+    A[2, 2] = - 2 * tf * Dm / V                 # d/dV
+    A[2, 3] = -tf * p.g0 * np.cos( gamma )      # d/d_gamma
+    A[2, 4] = tf * Dm                           # d/z 
 
-    # Row 3 : gamma_dot = tf*(-u2/V - cos(gamma)/(r^2*V))
-    # d/dr : tf * 2*cos(gamma)/(r^3*V)
-    A[3, 0] = tf * 2 * np.cos(gamma) / ( r**3 * V )
-    # d/dV : tf * (u2/V^2 + cos(gamma)/(r^2*V^2))
-    A[3, 2] = tf * ( u2 / V**2 + np.cos(gamma) / ( r**2 * V**2 ) )
-    # d/d_gamma : tf * sin(gamma)/(r^2*V)
-    A[3, 3] = tf * np.sin( gamma ) / ( r**2 * V )
+    # Row 3 : gamma_dot = tf*(-u2/V - g0 cos(gamma))
+    A[3, 2] = tf * ( u2 +  p.g0 * np.cos( gamma ) ) / ( V**2 )                # d/dV
+    A[3, 3] = tf * p.g0 * np.sin( gamma ) / V                                  # d/d_gamma
 
     # Rows 4 & 5 (z_dot, t_dot) have no state dependence
     # => remain zero
 
     # ── Matrix B = df/du ──────────────────────────────────────────────────────
-    B = np.zeros((6, 4))
+    B = np.zeros( ( 6, 4 ) )
 
     # Row 0 : h_dot = tf*V*sin(gamma)
     B[0, 3] = V * np.sin( gamma )            # d/d_tf
@@ -185,11 +176,11 @@ def compute_ABC( xk, uk ):
 
     # Row 2 : V_dot = tf*(-u1 - D/m - sin(gamma)/r^2)
     B[2, 0] = -tf                          # d/d_u1
-    B[2, 3] = -u1 - Dm - np.sin( gamma ) / r**2   # d/d_tf
+    B[2, 3] = -u1 - Dm - ( p.g0 * np.sin( gamma ) ) # d/d_tf
 
     # Row 3 : gamma_dot = tf*(-u2/V - cos(gamma)/(r^2*V))
     B[3, 1] = -tf / V                      # d/d_u2
-    B[3, 3] = -u2 / V - np.cos( gamma ) / ( r**2 * V )  # d/d_tf
+    B[3, 3] = -( u2 / V ) - ( p.g0 * np.cos( gamma ) / V )  # d/d_tf
 
     # Row 4 : z_dot = -tf*u3/Isp
     B[4, 2] = -tf / ( p.g0 * p.Isp )                  # d/d_u3
