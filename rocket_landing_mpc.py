@@ -23,8 +23,9 @@ from dataclasses import dataclass
 
 import numpy as np
 import cvxpy as cp
-from scipy.integrate import solve_ivp
 import matplotlib.pyplot as plt
+from scipy.interpolate import interp1d
+
 
 # ─────────────────────────────────────────────
 # 1. ROCKET PARAMETERS  (Table 1 of the paper)
@@ -96,14 +97,15 @@ def drag_accel(h, V, z):
     m   = np.exp( z )
     return D / m
 
-def dynamics( tau, x, u ):
+
+def dynamics( x, u ):
     """
     Nonlinear continuous dynamics dx/dtau = f(x, u).
     tau in [0,1] is the normalized independent variable (Eq. 8).
     u = [u1, u2, u3, tf]
     """
     h, s, V, gamma, z, t = x
-    u1, u2, u3, tf       = u
+    u1, u2, u3, tf = u
 
     r = h + p.R0
     Dm  = drag_accel( h, V, z )          # D/m
@@ -117,9 +119,6 @@ def dynamics( tau, x, u ):
 
     return np.array( [ h_dot, s_dot, V_dot, gamma_dot, z_dot, t_dot ] ) 
 
-# ─────────────────────────────────────────────
-# 4. LINEARIZATION  (Eq. 17-20)
-# ─────────────────────────────────────────────
 
 def compute_ABC( xk, uk ):
     """
@@ -190,44 +189,13 @@ def compute_ABC( xk, uk ):
     B[5, 3] = 1.0                          # d/d_tf
 
     # ── Affine offset c = f(xk,uk) - A@xk - B@uk ─────────────────────────────
-    fk = dynamics( None, xk, uk )
+    fk = dynamics( xk, uk )
     C  = fk - A @ xk - B @ uk
 
     return A, B, C
 
-# ─────────────────────────────────────────────
-# 5. DISCRETIZATION  (Eq. 26 - trapezoidal rule)
-# ─────────────────────────────────────────────
 
-def build_trapezoidal_constraints( X, U, Ak_list, Bk_list, Ck_list, dtau ):
-    """
-    Build the list of CVXPY trapezoidal collocation constraints.
-
-    X : cp.Variable (6, N+1)   -- states  at each node
-    U : cp.Variable (4, N+1)   -- controls at each node
-    Ak_list, Bk_list, Ck_list  -- linearization matrices at each node (numpy)
-    dtau : float               -- uniform step in tau
-    """
-    constraints = []
-    N = X.shape[1] - 1
-
-    for i in range(N):
-        # dynamics at node i and i+1
-        fi  = Ak_list[i]  @ X[:, i]   + Bk_list[i]  @ U[:, i]   + Ck_list[i]
-        fi1 = Ak_list[i+1] @ X[:, i+1] + Bk_list[i+1] @ U[:, i+1] + Ck_list[i+1]
-
-        # trapezoidal rule: x_{i+1} = x_i + dtau/2 * (f_i + f_{i+1})
-        constraints.append(
-            X[:, i+1] == X[:, i] + (dtau / 2.0) * (fi + fi1)
-        )
-
-    return constraints
-
-# ─────────────────────────────────────────────
-# 6. SEQUENTIAL CONVEX OPTIMIZATION (Problem 2)
-# ─────────────────────────────────────────────
-
-def solve_trajectory_optimization( x0, N=20, max_iter=15, tol=1e-4, tf_guess=20.0 ):
+def solve_trajectory_optimization( x0, N=20, max_iter=15, tol=1e-2, tf_guess=20.0 ):
     """
     Solve the fuel-optimal landing trajectory via sequential convex programming.
 
@@ -269,7 +237,7 @@ def solve_trajectory_optimization( x0, N=20, max_iter=15, tol=1e-4, tf_guess=20.
         tf_guess
     ])
 
-    U_ref   = np.tile( u_guess[ :, None ], ( 1, N + 1 ) )   # shape (4, N+1)
+    U_ref = np.tile( u_guess[ :, None ], ( 1, N + 1 ) )   # shape (4, N+1)
 
     X_prev = X_ref.copy()
     U_prev = U_ref.copy()
@@ -288,9 +256,13 @@ def solve_trajectory_optimization( x0, N=20, max_iter=15, tol=1e-4, tf_guess=20.
             Ck_list.append( C )
 
         # ── CVXPY decision variables ──────────────────────────────────────────
-        X = cp.Variable( (6, N + 1) )   # states
-        U = cp.Variable( (4, N + 1) )   # controls
+        X = cp.Variable( ( 6, N + 1 ) )   # states
+        U = cp.Variable( ( 4, N + 1 ) )   # controls
         # Note: tf is U[3, :] -- same value at every node (enforced below)
+
+        # ── Warm Start ──────────────────────────────────────────
+        X.value = X_prev
+        U.value = U_prev
 
         constraints = []
 
@@ -300,70 +272,68 @@ def solve_trajectory_optimization( x0, N=20, max_iter=15, tol=1e-4, tf_guess=20.
         )
 
         # ── tf must be the same scalar at every node ──────────────────────────
-        for i in range(1, N + 1):
+        for i in range( 1, N + 1 ):
             constraints.append( U[3, i] == U[3, 0] )
 
-        tf_var = U[3, 0]   # convenient alias
-
         # ── Initial boundary conditions (Eq. 3) ──────────────────────────────
-        constraints.append(X[:, 0] == x0)
+        constraints.append( X[:, 0] == x0 )
 
         # ── Terminal boundary conditions (Eq. 3 & 4) ─────────────────────────
-        constraints.append(X[0, N] == 0.0)        # hf = 0
-        constraints.append(X[1, N] == 1000.0)     # sf = 1000 m
-        constraints.append(X[2, N] <= V_safe)     # Vf <= Vsafe
-        constraints.append(X[3, N] == gamma_f)    # gamma_f = -90 deg
+        constraints.append( X[0, N] == 0.0 )        # hf = 0
+        constraints.append( X[1, N] == 1000.0 )     # sf = 1000 m
+        constraints.append( X[2, N] <= V_safe )     # Vf <= Vsafe
+        constraints.append( X[3, N] == gamma_f )    # gamma_f = -90 deg
 
         # Fuel constraint: z_f >= z_dry  (Eq. 4: mf >= m_dry)
-        constraints.append(X[4, N] >= p.z_dry)
+        constraints.append( X[4, N] >= p.z_dry )
 
         # Angle of attack terminal constraint (Eq. 13, linearized form):
         # |u2/u1| <= tan(alpha_safe)  at final node
         constraints.append(
-            cp.abs(U[1, N]) <= np.tan(alpha_safe) * U[0, N]
+            cp.abs( U[1, N] ) <= np.tan( alpha_safe ) * U[0, N]
         )
 
         # ── Process constraints (Eq. 14) ─────────────────────────────────────
         for i in range(N + 1):
-            ez_k = np.exp(-X_prev[4, i])        # e^{-z^k} (fixed, from linearization)
+            ez_k = np.exp( -X_prev[4, i] )        # e^{-z^k} (fixed, from linearization)
 
             # T_min * e^{-z} <= u3 <= T_max * e^{-z}   (from Eq. 14, after e^z linearization)
-            constraints.append(p.T_min * ez_k <= U[2, i])
-            constraints.append(U[2, i] <= p.T_max * ez_k)
+            constraints.append( p.T_min * ez_k <= U[2, i] )
+            constraints.append( U[2, i] <= p.T_max * ez_k )
 
             # Angle of attack: |u2/u1| <= tan(alpha_max)  =>  |u2| <= tan(alpha_max)*u1
             constraints.append(
-                cp.abs(U[1, i]) <= np.tan(alpha_max) * U[0, i]
+                cp.abs( U[1, i] ) <= np.tan( alpha_max ) * U[0, i]
             )
 
             # SOCP / lossless convexification (Eq. 22):
             # u1^2 + u2^2 <= u3^2
             constraints.append(
-                cp.norm(U[:2, i], 2) <= U[2, i]
+                cp.norm( U[:2, i], 2 ) <= U[2, i]
             )
 
         # tf must be positive
-        constraints.append( U[3, 0] >= 5.0)
-        # constraints.append(U[3, 0] <= 60.0)
+        constraints.append( U[3, 0] >= 5.0 )
 
         # ── Objective: maximize final mass = minimize -z_f  (Eq. 12) ─────────
         objective = cp.Minimize( -X[4, N] )
 
         # ── Solve ─────────────────────────────────────────────────────────────
-        prob = cp.Problem(objective, constraints)
-        prob.solve(solver=cp.SCS, verbose=False)
+        prob = cp.Problem( objective, constraints )
+        prob.solve( solver=cp.SCS, verbose=False, warm_start=True )
 
-        if prob.status not in ["optimal", "optimal_inaccurate"]:
-            print(f"  Iter {iteration+1}: solver status = {prob.status}. Stopping.")
+        if prob.status not in [ "optimal", "optimal_inaccurate" ]:
+            print( f"  Iter {iteration+1}: solver status = {prob.status}. Stopping." )
             break
 
         X_sol = X.value
         U_sol = U.value
 
         # ── Convergence check (Eq. 24) ────────────────────────────────────────
-        dx = np.max(np.abs(X_sol - X_prev))
-        du = np.max(np.abs(U_sol - U_prev))
-        tf_val = U_sol[3, 0]
+        dx = np.max( np.abs( X_sol - X_prev ) )
+        du = np.max( np.abs( U_sol - U_prev ) )
+        tf_val = U_sol[ 3, 0 ]
+
         print(f"  Iter {iteration+1}: tf = {tf_val:.3f} s | "
               f"fuel = {(np.exp(x0[4]) - np.exp(X_sol[4,-1])):.1f} kg | "
               f"dx={dx:.2e}, du={du:.2e}")
@@ -381,62 +351,434 @@ def solve_trajectory_optimization( x0, N=20, max_iter=15, tol=1e-4, tf_guess=20.
     return X_sol, U_sol
 
 
+def compute_ABC_MPC( xk, uk ):
+    """
+    Compute linearization matrices A, B, and affine offset c at (xk, uk).
+
+    Linearized dynamics:
+        dx/dtau = A @ x + B @ u + c
+
+    where c = f(xk,uk) - A @ xk - B @ uk  (Eq. 20)
+
+    Returns A (5x5), B (5x3), c (5,)
+    """
+    h, s, V, gamma, z = xk
+    u1, u2, u3 = uk
+
+    r = h + p.R0
+
+    rho = air_density( h )
+    m   = np.exp( z )
+    D   = 0.5 * rho * V**2 * p.S_ref * p.C_D
+    Dm  = D / m                            # D/m
+
+    # ── Matrix A = df/dx ──────────────────────────────────────────────────────
+    A = np.zeros( ( 5, 5 ) )
+
+    # Row 0 : h_dot = tf * V * sin(gamma)
+    A[0, 2] = np.sin( gamma )           # d/dV
+    A[0, 3] = V * np.cos( gamma )       # d/d_gamma
+
+    # Row 1 : s_dot = tf * V * cos(gamma)
+    A[1, 2] = np.cos( gamma )           # d/dV
+    A[1, 3] = - V * np.sin( gamma )      # d/d_gamma
+
+    # Row 2 : V_dot = tf*(-u1 - D/m - g0 sin(gamma))
+    A[2, 2] = - 2 * Dm / V                 # d/dV
+    A[2, 3] = - p.g0 * np.cos( gamma )      # d/d_gamma
+    A[2, 4] = Dm                           # d/z 
+
+    # Row 3 : gamma_dot = tf*(-u2/V - g0 cos(gamma))
+    A[3, 2] = ( u2 +  p.g0 * np.cos( gamma ) ) / ( V**2 )                # d/dV
+    A[3, 3] = p.g0 * np.sin( gamma ) / V                                  # d/d_gamma
+
+    # Row 4 (z_dot) has no state dependence
+    # => remain zero
+
+    # ── Matrix B = df/du ──────────────────────────────────────────────────────
+    B = np.zeros( ( 5, 3 ) )
+
+    # Row 2 : V_dot = tf*(-u1 - D/m - sin(gamma)/r^2)
+    B[2, 0] = -1                        # d/d_u1
+
+    # Row 3 : gamma_dot = tf*(-u2/V - cos(gamma)/(r^2*V))
+    B[3, 1] = -1 / V                      # d/d_u2
+
+    # Row 4 : z_dot = -tf*u3/Isp
+    B[4, 2] = -1 / ( p.g0 * p.Isp )                  # d/d_u3
+
+    # ── Affine offset c = f(xk,uk) - A@xk - B@uk ─────────────────────────────
+    fk = dynamics_MPC( xk, uk )
+    C  = fk - A @ xk - B @ uk
+
+    return A, B, C
+
+
+def build_trapezoidal_constraints( X, U, Ak_list, Bk_list, Ck_list, dtau ):
+    """
+    Build the list of CVXPY trapezoidal collocation constraints.
+
+    X : cp.Variable (6, N+1)   -- states  at each node
+    U : cp.Variable (4, N+1)   -- controls at each node
+    Ak_list, Bk_list, Ck_list  -- linearization matrices at each node (numpy)
+    dtau : float               -- uniform step in tau
+    """
+    constraints = []
+    N = X.shape[ 1 ] - 1
+
+    for i in range( N ):
+        # dynamics at node i and i+1
+        fi  = Ak_list[ i ]  @ X[ :, i ]   + Bk_list[ i ]  @ U[ :, i ]   + Ck_list[ i ]
+        fi1 = Ak_list[ i+1 ] @ X[ :, i+1 ] + Bk_list[ i+1 ] @ U[ :, i+1 ] + Ck_list[ i+1 ]
+
+        # trapezoidal rule: x_{i+1} = x_i + dtau/2 * (f_i + f_{i+1})
+        constraints.append(
+            X[ :, i+1 ] == X[ :, i ] + ( dtau / 2.0 ) * ( fi + fi1 )
+        )
+
+    return constraints
+
+def interpolate_reference( X, U, dt=0.1 ): 
+    """
+    Interpolate reference trajectory to uniform timestep.
+    
+    X: ( 6, N ) array - states [ r, s, V, gamma, z, t ]
+    U: ( 4, N ) array - controls [ u1, u2, u3, tf ]
+    dt: timestep for interpolation ( default 0.1s )
+    
+    Returns t_uniform, X_interp, U_interp at uniform dt timestep.
+    """
+    # The actual time values are stored in X[ 5, : ] ( the 't' state )
+    t_nodes = X[ 5, : ]
+    t_end_rounded = np.round(t_nodes[-1] / dt) * dt
+    X[5, -1] = t_end_rounded
+
+    t_nodes = X[ 5, : ]
+    t_start = t_nodes[ 0 ]
+    t_end   = t_nodes[ -1 ]
+    t_uniform = np.arange( t_start, t_end + dt, dt )
+    t_uniform[ -1 ] = t_end  # ensure last point is exactly t_end (because of float precision)
+    
+    X_interp = np.zeros( ( X.shape[ 0 ]-1, len( t_uniform ) ) )
+
+    for i in range( X.shape[ 0 ]-1):
+        f = interp1d( t_nodes, X[ i, : ], kind='linear' )
+        X_interp[ i, : ] = f( t_uniform )
+
+    # X_interp[ 5, : ] = t_uniform
+    
+    # Interpolate u1, u2, u3; tf is constant
+    U_interp = np.zeros( ( U.shape[ 0 ]-1, len( t_uniform ) ) )
+
+    for i in range( U.shape[ 0 ]-1 ):  # u1, u2, u3
+        f = interp1d( t_nodes, U[ i, : ], kind='linear' )
+        U_interp[ i, : ] = f( t_uniform )
+
+    # U_interp[ 3, : ] = U[ 3, 0 ]  # t_end_rounded
+    
+    return t_uniform, X_interp, U_interp
+
+def dynamics_MPC( x, u ):
+    """
+    Nonlinear continuous dynamics dx/dtau = f(x, u).
+    tau in [0,1] is the normalized independent variable (Eq. 8).
+    u = [u1, u2, u3, tf]
+    """
+    h, s, V, gamma, z = x
+    u1, u2, u3 = u
+
+    r = h + p.R0
+    Dm  = drag_accel( h, V, z )          # D/m
+
+    h_dot     = V * np.sin( gamma )
+    s_dot     = V * np.cos( gamma )
+    V_dot     = -u1 - Dm - ( p.g0 * np.sin( gamma ) ) 
+    gamma_dot = -( u2 / V ) - ( p.g0 * np.cos( gamma ) / V ) 
+    z_dot     = u3 / ( p.g0 * p.Isp )
+
+    return np.array( [ h_dot, s_dot, V_dot, gamma_dot, z_dot ] )
+
+
+def step_dynamics_mpc(x,u):
+    h, s, V, gamma, z = x
+    u1, u2, u3 = u
+
+    r = h + p.R0
+    Dm  = drag_accel( h, V, z )          # D/m
+
+    h_next     = h + ( V * np.sin( gamma ) ) * 0.1
+    s_next     = s + ( V * np.cos( gamma ) ) * 0.1
+    V_next     = V + ( -u1 - Dm - ( p.g0 * np.sin( gamma ) ) ) * 0.1
+    gamma_next = gamma + ( -( u2 / V ) - ( p.g0 * np.cos( gamma ) / V ) ) * 0.1
+    z_next     = z + ( - u3 / ( p.g0 * p.Isp ) ) * 0.1
+
+    return np.array( [ h_next, s_next, V_next, gamma_next, z_next ] )
+
+
+def run_mpc( X_ref, U_ref, dt, N, max_iter, tol, fig, axes ):
+
+    Q = np.diag( [ 0.1, 0.1, 1, 1, 1 ] )  # don't penalize 't' state
+    R = np.diag( [ 100, 100, 100 ] )        # don't penalize 'tf' control
+
+    # Interpolate the reference trajectory to uniform time steps for MPC tracking because it is sparse
+    t_uniform, X_interp, U_interp = interpolate_reference( X_ref, U_ref, dt )
+
+    X_mpc = np.empty( ( 5, 0 ) )   # states for MPC (exclude 't' state)
+    U_mpc = np.empty( ( 3, 0 ) )   # controls for MPC (exclude 'tf' control)
+
+    # Vector of dynamics
+    x0 = X_interp[ :, 0 ].copy()
+    X_mpc = np.column_stack( [ X_mpc, x0 ] )
+
+    for i in range( len( t_uniform ) - 1 ):
+
+        if( i + N + 1 > len( t_uniform ) ):
+            # Number of points left smaller than MPC horizon, use whatever is left
+            N_mpc = len( t_uniform ) - i - 1
+        else:
+            N_mpc = N
+
+        print( f"MPC step {i}/{len(t_uniform)-1} | horizon: {i} to {i+N_mpc+1}" )
+
+        # Horizon reference trajectory
+        X_ref_mpc = X_interp[ :, i : i+N_mpc+1 ]
+        U_ref_mpc = U_interp[ :, i : i+N_mpc+1 ]
+
+        X_prev = X_ref_mpc.copy()
+        U_prev = U_ref_mpc.copy()
+
+        for iteration in range( max_iter ):
+            # Compute linearization matrices at each node
+            Ak_list = []
+            Bk_list = []
+            Ck_list = []
+
+            for k in range( N_mpc + 1 ):
+                A, B, C = compute_ABC_MPC( X_prev[:, k], U_prev[:, k] )
+                Ak_list.append( A )
+                Bk_list.append( B )
+                Ck_list.append( C )
+
+            # ── CVXPY decision variables ──────────────────────────────────────────
+            X = cp.Variable( ( 5, N_mpc + 1 ) )   # states
+            U = cp.Variable( ( 3, N_mpc + 1 ) )   # controls
+
+            # ── Warm Start ──────────────────────────────────────────
+            X.value = X_prev
+            U.value = U_prev
+
+            constraints = []
+
+            # ── Dynamics constraints (trapezoidal, Eq. 26) ───────────────────────
+            constraints += build_trapezoidal_constraints(
+                X, U, Ak_list, Bk_list, Ck_list, dt
+            )
+
+            # ── Initial boundary conditions (Eq. 3) ──────────────────────────────
+            constraints.append( X[:, 0] == x0 )
+
+            # Try these terminal constraints, if not, add a terminal cost to the objective
+            # Terminal constraint to keep it in line with the reference
+            # If I don't the rocket might spend more fuel and might not have enough to land, because MPC is looking at a short horizon
+            # constraints.append( X[0, N_mpc] == X_ref_mpc[0, -1] ) 
+            # constraints.append( X[1, N_mpc] == X_ref_mpc[1, -1] )     
+            # constraints.append( X[2, N_mpc] == X_ref_mpc[2, -1] )     
+            # constraints.append( X[3, N_mpc] == X_ref_mpc[3, -1] )    
+            # constraints.append( X[4, N_mpc] >= X_ref_mpc[4, -1] )       # Can relax mass to be bigger or equal 
+
+
+            # Angle of attack terminal constraint (Eq. 13, linearized form):
+            # |u2/u1| <= tan(alpha_safe)  at final node
+            constraints.append(
+                cp.abs( U[1, N_mpc] ) <= np.tan( alpha_safe ) * U[0, N_mpc]
+            )
+
+            # ── Process constraints (Eq. 14) ─────────────────────────────────────
+            for i in range( N_mpc + 1 ):
+
+                ez_k = np.exp( -X_prev[4, i] )        # e^{-z^k} (fixed, from linearization)
+
+                # T_min * e^{-z} <= u3 <= T_max * e^{-z}   (from Eq. 14, after e^z linearization)
+                constraints.append( p.T_min * ez_k <= U[2, i] )
+                constraints.append( U[2, i] <= p.T_max * ez_k )
+
+                # Angle of attack: |u2/u1| <= tan(alpha_max)  =>  |u2| <= tan(alpha_max)*u1
+                constraints.append(
+                    cp.abs( U[1, i] ) <= np.tan( alpha_max ) * U[0, i]
+                )
+
+                # SOCP / lossless convexification (Eq. 22):
+                # u1^2 + u2^2 <= u3^2
+                constraints.append(
+                    cp.norm( U[:2, i], 2 ) <= U[2, i]
+                )
+
+            # ── Objective: minimize tracking error from reference ─────────
+            objective = cp.Minimize(
+                sum(
+                    cp.quad_form( X[:, k] - X_ref_mpc[:, k], Q ) +
+                    cp.quad_form(U[:, k] - U_ref_mpc[:, k], R )
+                    for k in range(N_mpc + 1)
+                )
+            )
+
+            # ── Solve ─────────────────────────────────────────────────────────────
+            prob = cp.Problem( objective, constraints )
+            prob.solve( solver=cp.SCS, verbose=False, warm_start=True )
+
+            if prob.status not in [ "optimal", "optimal_inaccurate" ]:
+                print( f"  Iter {iteration+1}: solver status = {prob.status}. Stopping." )
+                break
+
+            X_sol = X.value
+            U_sol = U.value
+
+            # ── Convergence check (Eq. 24) ────────────────────────────────────────
+            dx = np.max( np.abs( X_sol - X_prev ) )
+            du = np.max( np.abs( U_sol - U_prev ) )
+
+            # print(f"  Iter {iteration+1}:"
+            #     f"fuel = {(np.exp(x0[4]) - np.exp(X_sol[4,-1])):.1f} kg | "
+            #     f"dx={dx:.2e}, du={du:.2e}")
+            
+            # print( X_sol )
+            # print( U_sol )
+
+            X_prev = X_sol.copy()
+            U_prev = U_sol.copy()
+
+            if dx < tol and du < tol:
+                print(f"Converged at iteration {iteration+1}.")
+                break
+
+        U_mpc = np.column_stack( [ U_mpc, U_sol[:, 0] ] )  # first control input of the optimal sequence
+
+        plot_mpc( fig, axes, X_mpc, U_mpc, t_uniform )
+
+        # Update dynamics by applying the first control input and simulating the nonlinear dynamics for one step
+        x0 = step_dynamics_mpc( x0, U_sol[:,0])
+        X_mpc = np.column_stack( [ X_mpc, x0 ] )
+
+        print( f"h={x0[0]:.1f} m, s={x0[1]:.1f} m, V={x0[2]:.1f} m/s, gamma={np.rad2deg(x0[3]):.1f} deg, mass={np.exp(x0[4]):.1f} kg" )
+        print( f"u1={U_sol[0,0]:.2f}, u2={U_sol[1,0]:.2f}, u3={U_sol[2,0]:.2f}" )
+        print()
+
+    return X_mpc, U_mpc, t_uniform
+
 # ─────────────────────────────────────────────
 # 7. PLOTTING
 # ─────────────────────────────────────────────
 
-def plot_trajectory(X, U, title="Rocket Landing Trajectory"):
+def plot_trajectory( X_ref, U_ref ):
     """Plot states and controls, matching Fig. 2 & 3 of the paper."""
-    tau = np.linspace(0, 1, X.shape[1])
-    tf  = U[3, 0]
-    t   = tau * tf
 
-    fig, axes = plt.subplots(2, 3, figsize=(14, 8))
+    title="Rocket Landing Trajectory"
+
+    tau = np.linspace( 0, 1, X_ref.shape[1] )
+    tf = U_ref[ 3, 0 ]
+    t = tau * tf
+
+    fig, axes = plt.subplots(2, 3, figsize=( 14, 8 ) )
     fig.suptitle(title, fontsize=14)
 
     # States
-    axes[0, 0].plot(X[1], X[0])
-    axes[0, 0].set_xlabel("s (m)")
-    axes[0, 0].set_ylabel("r / altitude (m)")
-    axes[0, 0].set_title("Trajectory")
+    # Trajectory: altitude vs horizontal position
+    axes[0, 0].plot(X_ref[1], X_ref[0], marker='o', fillstyle='none', label="Ref" )
+    axes[0, 0].plot( [], [], 'r--', label="MPC" )
+    axes[0, 0].set_xlabel( "Downrange s (m)" )
+    axes[0, 0].set_ylabel( "Altitude h (m)" )
+    axes[0, 0].set_title( "Trajectory" )
     axes[0, 0].grid(True)
+    axes[0, 0].legend()
 
-    axes[0, 1].plot(t, X[2])
+    # Speed
+    axes[0, 1].plot( t, X_ref[2], marker='o', fillstyle='none', label="Ref" )
+    axes[0, 1].plot( [], [], 'r--', label="MPC" )
     axes[0, 1].set_xlabel("time (s)")
     axes[0, 1].set_ylabel("V (m/s)")
     axes[0, 1].set_title("Speed")
     axes[0, 1].grid(True)
-
-    axes[0, 2].plot(t, np.rad2deg(X[3]))
-    axes[0, 2].set_xlabel("time (s)")
-    axes[0, 2].set_ylabel("gamma (deg)")
-    axes[0, 2].set_title("Flight Path Angle")
-    axes[0, 2].grid(True)
+    axes[0, 1].legend()
+    
+    # Flight path angle
+    axes[0, 2].plot(t, np.rad2deg( X_ref[ 3 ] ), marker='o', fillstyle='none', label="Ref" )
+    axes[0, 2].plot( [], [], 'r--', label="MPC" )
+    axes[0, 2].set_xlabel( "time (s)" )
+    axes[0, 2].set_ylabel( "gamma (deg)" )
+    axes[0, 2].set_title( "Flight Path Angle" )
+    axes[0, 2].grid( True )
+    axes[0, 2].legend()
 
     # Controls
-    T_vals     = U[2] * np.exp(X[4])   # u3 * m = T (N)
-    alpha_vals = np.arctan2(U[1], U[0]) # angle of attack
+    T_vals     = U_ref[2] * np.exp( X_ref[4] )   # u3 * m = T (N)
+    alpha_vals = np.arctan2( U_ref[1], U_ref[0] ) # angle of attack
 
-    axes[1, 0].plot(t, T_vals / 1e3)
+    # Thrust
+    axes[1, 0].plot(t, T_vals / 1e3, marker='o', fillstyle='none', label="Ref" )
+    axes[1, 0].plot( [], [], 'r--', label="MPC" )
     axes[1, 0].set_xlabel("time (s)")
     axes[1, 0].set_ylabel("T (kN)")
     axes[1, 0].set_title("Thrust")
     axes[1, 0].grid(True)
+    axes[1, 0].legend()
 
-    axes[1, 1].plot(t, np.rad2deg(alpha_vals))
+    # Angle of attack
+    axes[1, 1].plot(t, np.rad2deg(alpha_vals), marker='o', fillstyle='none', label="Ref" )
+    axes[1, 1].plot( [], [], 'r--', label="MPC" )
     axes[1, 1].set_xlabel("time (s)")
     axes[1, 1].set_ylabel("alpha (deg)")
     axes[1, 1].set_title("Angle of Attack")
     axes[1, 1].grid(True)
+    axes[1, 1].legend()
 
-    axes[1, 2].plot(t, np.exp(X[4]))
+    # Mass
+    axes[1, 2].plot( t, np.exp(X_ref[4]), marker='o', fillstyle='none', label="Ref" )
+    axes[1, 2].plot( [], [], 'r--', label="MPC" )
     axes[1, 2].set_xlabel("time (s)")
     axes[1, 2].set_ylabel("mass (kg)")
     axes[1, 2].set_title("Mass")
     axes[1, 2].grid(True)
+    axes[1, 2].legend()
 
     plt.tight_layout()
-    plt.show()
+    plt.show( block=False )
+
+    return fig, axes
+
+
+def plot_mpc( fig, axes, X_mpc, U_mpc, t_uniform ):
+    # States
+    # Trajectory: altitude vs horizontal position
+    mpc_line = axes[0,0].lines[1]
+    mpc_line.set_data( X_mpc[1], X_mpc[0] )
+
+    n = X_mpc.shape[1]
+    t = t_uniform[ : n ]
+
+    mpc_line = axes[ 0, 1 ].lines[1]
+    mpc_line.set_data( t, X_mpc[2] )
+
+    mpc_line = axes[ 0, 2 ].lines[1]
+    mpc_line.set_data( t, np.rad2deg( X_mpc[ 3 ] ) )
+
+    # Controls
+    T_vals     = U_mpc[2] * np.exp( X_mpc[4] )   # u3 * m = T (N)
+    alpha_vals = np.arctan2( U_mpc[1], U_mpc[0] ) # angle of attack
+
+    mpc_line = axes[ 1, 0 ].lines[1]
+    mpc_line.set_data( t, T_vals / 1e3 )
+
+    mpc_line = axes[ 1, 1 ].lines[1]
+    mpc_line.set_data( t, np.rad2deg(alpha_vals) )
+
+    mpc_line = axes[ 1, 2 ].lines[1]
+    mpc_line.set_data( t, np.exp( X_mpc[ 4 ] ) )
+
+    fig.canvas.draw()
+    fig.canvas.flush_events()
+    
+
+
 
 # ─────────────────────────────────────────────
 # 9. MAIN
@@ -460,23 +802,37 @@ if __name__ == "__main__":
     
     X_opt, U_opt = solve_trajectory_optimization( 
         x0 = x0,
-        N=20, 
+        N=30, 
         max_iter=100, 
-        tol=1e-4, 
+        tol=1e-1, 
         tf_guess=20.0
     )
 
     tf_opt   = U_opt[ 3, 0 ]
     fuel_opt = np.exp( x0[4] ) - np.exp( X_opt[4, -1] )
     print(f"\nOptimal tf   = {tf_opt:.2f} s")
+    print(f"dt    = {tf_opt / 20:.2f} s")
     print(f"Fuel used    = {fuel_opt:.1f} kg")
     print(f"Final mass   = {np.exp(X_opt[4,-1]):.1f} kg")
 
-    plot_trajectory(X_opt, U_opt, title="Trajectory Optimization Result")
+    fig, axes = plot_trajectory( X_opt, U_opt )
 
-    # ── Uncomment to run MPC ──────────────────────────────────────────────────
-    # print("\n" + "="*60)
-    # print("STEP 2: MPC Guidance")
-    # print("="*60)
-    # X_mpc, U_mpc = run_mpc(X_opt, U_opt, guidance_dt=0.1)
-    # print(f"MPC landed at h={X_mpc[-1,0]:.2f}m, s={X_mpc[-1,1]:.1f}m")
+    # MPC
+    print("\n" + "="*60)
+    print("STEP 2: MPC Guidance")
+    print("="*60)
+
+    X_mpc, U_mpc, t_uniform = run_mpc(
+        X_ref=X_opt,
+        U_ref=U_opt,
+        dt=0.1, 
+        N=15,
+        max_iter=20,
+        tol=1e-1,
+        fig=fig,
+        axes=axes
+    )
+
+    print( f"MPC landed at h={X_mpc[0, -1 ]:.2f}m, s={X_mpc[ 1, -1 ]:.1f}m" )
+
+    plt.show( block=True )
