@@ -438,6 +438,7 @@ def build_trapezoidal_constraints( X, U, Ak_list, Bk_list, Ck_list, dtau ):
 
     return constraints
 
+
 def interpolate_reference( X, U, dt=0.1 ): 
     """
     Interpolate reference trajectory to uniform timestep.
@@ -464,8 +465,6 @@ def interpolate_reference( X, U, dt=0.1 ):
     for i in range( X.shape[ 0 ]-1):
         f = interp1d( t_nodes, X[ i, : ], kind='linear' )
         X_interp[ i, : ] = f( t_uniform )
-
-    # X_interp[ 5, : ] = t_uniform
     
     # Interpolate u1, u2, u3; tf is constant
     U_interp = np.zeros( ( U.shape[ 0 ]-1, len( t_uniform ) ) )
@@ -473,8 +472,6 @@ def interpolate_reference( X, U, dt=0.1 ):
     for i in range( U.shape[ 0 ]-1 ):  # u1, u2, u3
         f = interp1d( t_nodes, U[ i, : ], kind='linear' )
         U_interp[ i, : ] = f( t_uniform )
-
-    # U_interp[ 3, : ] = U[ 3, 0 ]  # t_end_rounded
     
     return t_uniform, X_interp, U_interp
 
@@ -517,8 +514,22 @@ def step_dynamics_mpc(x,u):
 
 def run_mpc( X_ref, U_ref, dt, N, max_iter, tol, fig, axes ):
 
-    Q = np.diag( [ 0.1, 0.1, 1, 1, 1 ] )  # don't penalize 't' state
-    R = np.diag( [ 100, 100, 100 ] )        # don't penalize 'tf' control
+    Q = np.diag( [ 
+        1 / 1**2, 
+        1 / 10**2,
+        1 / 20**2,
+        1 / 0.1**2, 
+        1 / 0.05**2
+    ] )   
+                         # state tracking weights
+
+    R = np.diag([
+        1/10**2,    # u1 → 1e-2
+        1/5**2,     # u2 → 4e-2
+        1/10**2,    # u3 → 1e-2
+    ])                           # control tracking weights  
+
+    terminal_weight = Q.copy() * 100        # higher weights for terminal states
 
     # Interpolate the reference trajectory to uniform time steps for MPC tracking because it is sparse
     t_uniform, X_interp, U_interp = interpolate_reference( X_ref, U_ref, dt )
@@ -619,7 +630,8 @@ def run_mpc( X_ref, U_ref, dt, N, max_iter, tol, fig, axes ):
                     cp.quad_form( X[:, k] - X_ref_mpc[:, k], Q ) +
                     cp.quad_form(U[:, k] - U_ref_mpc[:, k], R )
                     for k in range(N_mpc + 1)
-                )
+                ) 
+                + cp.quad_form( X[:, -1] - X_ref_mpc[:, -1], terminal_weight )
             )
 
             # ── Solve ─────────────────────────────────────────────────────────────
@@ -826,13 +838,13 @@ if __name__ == "__main__":
         X_ref=X_opt,
         U_ref=U_opt,
         dt=0.1, 
-        N=15,
+        N=20,
         max_iter=20,
-        tol=1e-1,
+        tol=1e-2,
         fig=fig,
         axes=axes
     )
 
-    print( f"MPC landed at h={X_mpc[0, -1 ]:.2f}m, s={X_mpc[ 1, -1 ]:.1f}m" )
+    print( f"MPC landed at h={X_mpc[0, -1 ]:.2f}m, s={X_mpc[ 1, -1 ]:.1f}m, V={X_mpc[ 2, -1 ]:.1f}m/s, gamma={np.rad2deg(X_mpc[ 3, -1 ]):.1f}deg" )
 
     plt.show( block=True )
